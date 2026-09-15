@@ -1,0 +1,14 @@
+addict
+causal-conv1d
+einops
+matplotlib
+mamba-ssm
+numpy
+regex
+scikit-learn
+spconv-cu118
+termcolor
+timm
+torch
+torch-scatter
+yapf
