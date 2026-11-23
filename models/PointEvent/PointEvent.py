@@ -1,3 +1,10 @@
+"""
+Checkpoint Utils for Models
+
+Author: Zongze Wu (zongze0907@gmail.com)
+Please cite our work if the code is helpful to you.
+"""
+
 from functools import partial
 from addict import Dict
 import math
@@ -113,12 +120,21 @@ class SimpleStateSpaceModelBlock(PointModule):
         channels,
         gather_num,
         order_index=0,
+        polarity_write_mode="none",
+        relation_scale=(0.03, 0.03, 0.03),
     ):
         super().__init__()
         self.channels = channels
         self.order_index = order_index
         self.gather_num = gather_num
-        self.mamba = SimpleAwareStateSpaceModel(d_model=channels, d_conv=5)
+        self.polarity_write_mode = polarity_write_mode
+        scale = torch.as_tensor(relation_scale, dtype=torch.float32)
+        if scale.shape != (3,) or not bool((scale > 0).all()):
+            raise ValueError("relation_scale must contain three positive values")
+        self.register_buffer("relation_scale", scale, persistent=False)
+        self.mamba = SimpleAwareStateSpaceModel(
+            d_model=channels, d_conv=5, polarity_write_mode=polarity_write_mode
+        )
         
     @torch.no_grad()
     def get_padding(self, point):
@@ -146,6 +162,24 @@ class SimpleStateSpaceModelBlock(PointModule):
         sp_inverse = point.serialized_inverse[self.order_index, :]
         return sp_inds, sp_inverse
     
+    @torch.no_grad()
+    def build_scan_relation(self, coord, polarity, valid_mask):
+        # Inputs have already been serialized using THIS block's order.
+        delta = torch.zeros_like(coord, dtype=torch.float32)
+        delta[:, 1:] = (coord[:, 1:].float() - coord[:, :-1].float()) / self.relation_scale.view(1, 1, 3)
+        signed_log_delta = torch.sign(delta) * torch.log1p(delta.abs())
+        abs_log_dt = torch.log1p(delta[..., 2:3].abs())
+        p_prev = torch.zeros_like(polarity)
+        p_prev[:, 1:] = polarity[:, :-1]
+        pair_valid = torch.zeros_like(valid_mask)
+        pair_valid[:, 1:] = valid_mask[:, 1:] & valid_mask[:, :-1]
+        relation = torch.cat([
+            signed_log_delta, abs_log_dt,
+            polarity, p_prev, polarity * p_prev,
+            pair_valid.unsqueeze(-1).to(coord.dtype),
+        ], dim=-1)
+        return relation * pair_valid.unsqueeze(-1).to(relation.dtype)
+
     def mssm_forward(self, point, return_feat = False):
         B = point.offset.shape[0]
         C = point.feat.shape[1]
@@ -165,7 +199,23 @@ class SimpleStateSpaceModelBlock(PointModule):
         L = max_bincount
         multi_feat_pad = multi_feat_pad.reshape(B, L, -1)
 
-        feat = self.mamba(multi_feat_pad) # B L C
+        valid_mask = multi_mask.reshape(B, L)
+        relation = None
+        polarity_pad = None
+        if self.polarity_write_mode in {"polarity", "geometry", "polarity_state"}:
+            if "event_polarity" not in point.keys():
+                raise ValueError("Save event_polarity before ECE; do not infer it from learned features")
+            polarity_pad = point.coord.new_zeros((B * L, 1), dtype=torch.float32)
+            polarity_pad[multi_mask] = point.event_polarity[sp_inds].float()
+            polarity_pad = polarity_pad.reshape(B, L, 1)
+        if self.polarity_write_mode in {"polarity", "geometry"}:
+            coord_pad = point.coord.new_zeros((B * L, 3), dtype=torch.float32)
+            coord_pad[multi_mask] = point.coord[sp_inds].float()
+            relation = self.build_scan_relation(
+                coord_pad.reshape(B, L, 3), polarity_pad, valid_mask
+            )
+        feat = self.mamba(multi_feat_pad, valid_mask=valid_mask, relation=relation,
+                          polarity=polarity_pad)
 
         if return_feat:
             return self.get_inverse(feat, B, L, multi_mask)[sp_inverse]
@@ -183,8 +233,11 @@ class SimpleStateSpaceModelBlock(PointModule):
         return self.mssm_forward(point, return_feat=return_feat)
 
 class SimpleStateSpaceModelBlock_TScan(SimpleStateSpaceModelBlock):
-    def __init__(self, channels, gather_num, order_index=0):
-        super().__init__(channels, gather_num, order_index)
+    def __init__(self, channels, gather_num, order_index=0,
+                 polarity_write_mode="none", relation_scale=(0.03, 0.03, 0.03)):
+        super().__init__(channels, gather_num, order_index,
+                         polarity_write_mode=polarity_write_mode,
+                         relation_scale=relation_scale)
         
     @torch.no_grad()
     def serialized(self, point):
@@ -209,6 +262,8 @@ class Block(PointModule):
         scan_mode="spatial",
         order_index=0,
         cpe_indice_key=None,
+        polarity_write_mode="none",
+        relation_scale=(0.03, 0.03, 0.03),
     ):
         super().__init__()
         self.channels = channels
@@ -235,12 +290,16 @@ class Block(PointModule):
                 channels=channels,
                 gather_num=gather_num,
                 order_index=order_index,
+                polarity_write_mode=polarity_write_mode,
+                relation_scale=relation_scale,
             )
         elif scan_mode == "temporal":
             self.attn = SimpleStateSpaceModelBlock_TScan(
                 channels=channels,
                 gather_num=gather_num,
                 order_index=order_index,
+                polarity_write_mode=polarity_write_mode,
+                relation_scale=relation_scale,
             )
         else:
             raise ValueError(f"Unknown scan_mode: {scan_mode}")
@@ -418,8 +477,6 @@ class SerializedPooling(PointModule):
             feat=feat_pool,
             coord=coord,
             grid_coord=point.grid_coord[head_indices] >> pooling_depth,
-            segment=point.segment[head_indices],
-            origin_t=point.origin_t[head_indices],
             serialized_code=code,
             serialized_order=order,
             serialized_inverse=inverse,
@@ -428,6 +485,10 @@ class SerializedPooling(PointModule):
             t_serialized_inverse = t_inverse,
             batch=batch,
         )
+
+        for key in ("segment", "origin_t"):
+            if key in point.keys():
+                point_dict[key] = point[key][head_indices]
 
         if "condition" in point.keys():
             point_dict["condition"] = point.condition
@@ -828,6 +889,9 @@ class PointEvent(PointModule):
         pdnorm_affine=True,
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
         use_context_branch=True,
+        polarity_write_mode="none",
+        relation_scale=(0.03, 0.03, 0.03),
+        polarity_encoding="zero_one",
     ):
         super().__init__()
         self.t_order_len = 2
@@ -835,6 +899,11 @@ class PointEvent(PointModule):
         self.cls_mode = cls_mode
         self.shuffle_orders = shuffle_orders
         self.use_context_branch = use_context_branch
+        self.polarity_write_mode = polarity_write_mode
+        self.relation_scale = relation_scale
+        if polarity_encoding not in {"zero_one", "signed"}:
+            raise ValueError("polarity_encoding must be 'zero_one' or 'signed'")
+        self.polarity_encoding = polarity_encoding
 
         stride = [stride] if isinstance(stride, int) else list(stride)
         enc_depths = [enc_depths] if isinstance(enc_depths, int) else list(enc_depths)
@@ -989,6 +1058,9 @@ class PointEvent(PointModule):
                     scan_mode=scan_mode,
                     order_index=order_idx,
                     cpe_indice_key=f"{name_prefix}_block{i}",
+                    polarity_write_mode=(self.polarity_write_mode
+                        if name_prefix in {"hr_pre", "hr_post"} else "none"),
+                    relation_scale=self.relation_scale,
                 ),
                 name=f"block{i}",
             )
@@ -996,6 +1068,10 @@ class PointEvent(PointModule):
 
     def forward(self, data_dict):
         point = Point_V2(data_dict)
+        # Preserve raw metadata before ECE replaces point.feat.
+        raw_polarity = point.feat[:, 3:4].detach()
+        point["event_polarity"] = (2.0 * raw_polarity - 1.0
+            if self.polarity_encoding == "zero_one" else raw_polarity)
         point.serialization(
             order=self.order,
             shuffle_orders=(self.shuffle_orders and self.training),

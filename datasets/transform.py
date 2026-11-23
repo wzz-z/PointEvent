@@ -111,6 +111,7 @@ class GridSampleBase:
         return_min_coord=False,
         return_displacement=False,
         project_displacement=False,
+        sample_seed=None,
     ):
         self.grid_size = self._as_3d_grid_size(grid_size)
         self.hash_type = hash_type
@@ -121,6 +122,9 @@ class GridSampleBase:
         self.return_min_coord = return_min_coord
         self.return_displacement = return_displacement
         self.project_displacement = project_displacement
+        # None keeps training stochastic. An integer fixes representatives for
+        # repeatable validation without resetting NumPy's global RNG.
+        self.sample_seed = sample_seed
         if self.hash_type not in {"fnv", "ravel"}:
             raise ValueError(f"Unsupported hash_type: {hash_type}")
 
@@ -207,7 +211,8 @@ class GridSampleEventNorm(GridSampleBase):
         self, data_dict, idx_sort, inverse, count, grid_coord, scaled_coord, min_coord
     ):
         start = np.cumsum(np.insert(count, 0, 0)[:-1])
-        offset = np.random.randint(0, count.max(), count.size)
+        rng = np.random if self.sample_seed is None else np.random.RandomState(self.sample_seed)
+        offset = rng.randint(0, count.max(), count.size)
         idx_unique = idx_sort[start + offset % count]
 
         if "sampled_index" in data_dict:

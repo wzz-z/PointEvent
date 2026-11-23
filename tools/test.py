@@ -1,9 +1,14 @@
+
+import os
+# os.environ['CUDA_VISIBLE_DEVICES'] = "3"
+
 from engines.defaults import (
     default_argument_parser,
     default_config_parser,
     default_setup,
 )
 from engines.test import TESTERS
+from engines.launch import launch
 
 
 def main_worker(cfg):
@@ -15,7 +20,15 @@ def main_worker(cfg):
 def main():
     args = default_argument_parser().parse_args()
     cfg = default_config_parser(args.config_file, args.options)
-    main_worker(cfg)
+
+    launch(
+        main_worker,
+        num_gpus_per_machine=args.num_gpus,
+        num_machines=args.num_machines,
+        machine_rank=args.machine_rank,
+        dist_url=args.dist_url,
+        cfg=(cfg,),
+    )
 
 
 if __name__ == "__main__":

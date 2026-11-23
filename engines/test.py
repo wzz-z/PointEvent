@@ -1,5 +1,13 @@
+"""
+Checkpoint Utils for Models
+
+Author: Zongze Wu (zongze0907@gmail.com)
+Please cite our work if the code is helpful to you.
+"""
 import os
+import sys
 import time
+import types
 from collections import OrderedDict
 from pathlib import Path
 import numpy as np
@@ -8,18 +16,40 @@ import torch.nn.functional as F
 import torch.utils.data
 from sklearn.metrics import auc, roc_curve
 
+from .defaults import create_ddp_model
 from datasets import build_dataset, collate_fn
 from models import build_model
 from utils.logger import get_root_logger
 from utils.misc import AverageMeter, intersection_and_union, make_dirs
 from utils.registry import Registry
 import utils.comm as comm
-from utils.view import (
-    build_event_array_from_npz,
-    save_event_txt_from_npz,
-    save_event_visualization,
-)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from utils.view import * 
 TESTERS = Registry("testers")
+
+
+def install_legacy_pointcept_aliases():
+    """Allow checkpoints saved before the flat-layout refactor to be loaded."""
+    if "pointcept" in sys.modules:
+        return
+    import datasets
+    import engines
+    import models
+    import utils
+
+    pointcept = types.ModuleType("pointcept")
+    pointcept.datasets = datasets
+    pointcept.engines = engines
+    pointcept.models = models
+    pointcept.utils = utils
+
+    sys.modules["pointcept"] = pointcept
+    sys.modules["pointcept.datasets"] = datasets
+    sys.modules["pointcept.engines"] = engines
+    sys.modules["pointcept.models"] = models
+    sys.modules["pointcept.utils"] = utils
 
 
 class TesterBase:
@@ -60,23 +90,30 @@ class TesterBase:
                 trainable_parameters / 1e6,
             )
         )
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is required for inference with this model.")
-        model = model.cuda()
+        model = create_ddp_model(
+            model.cuda(),
+            broadcast_buffers=False,
+            find_unused_parameters=self.cfg.find_unused_parameters,
+        )
         if not os.path.isfile(self.cfg.weight):
             raise RuntimeError("=> No checkpoint found at '{}'".format(self.cfg.weight))
 
         self.logger.info(f"Loading weight at: {self.cfg.weight}")
-        checkpoint = torch.load(self.cfg.weight, map_location="cpu")
-        state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+        install_legacy_pointcept_aliases()
+        checkpoint = torch.load(self.cfg.weight)
         weight = OrderedDict()
-        for key, value in state_dict.items():
+        for key, value in checkpoint["state_dict"].items():
             if key.startswith("module."):
-                key = key[7:]
+                if comm.get_world_size() == 1:
+                    key = key[7:]
+            elif comm.get_world_size() > 1:
+                key = "module." + key
             weight[key] = value
         model.load_state_dict(weight, strict=True)
         self.logger.info(
-            "=> Loaded weight '{}' (epoch {})".format(self.cfg.weight, checkpoint.get("epoch", "unknown"))
+            "=> Loaded weight '{}' (epoch {})".format(
+                self.cfg.weight, checkpoint["epoch"]
+            )
         )
         return model
 
@@ -281,13 +318,25 @@ class SemSegTester(TesterBase):
             data_name_raw = str(data_name)
             safe_name = data_name_raw.replace("+", "_")
 
-            candidate_names = [data_name_raw, safe_name]
+            # 兼容这些情况：
+            # 1. 004_label_opint_000000
+            # 2. test_004_label_opint_000000
+            # 3. test+004_label_opint_000000
+            candidate_names = []
+
+            candidate_names.append(data_name_raw)
+            candidate_names.append(safe_name)
+
             if data_name_raw.startswith("test+"):
                 candidate_names.append(data_name_raw[len("test+"):])
+
             if data_name_raw.startswith("test_"):
                 candidate_names.append(data_name_raw[len("test_"):])
+
             if safe_name.startswith("test_"):
                 candidate_names.append(safe_name[len("test_"):])
+
+            # 去重，保持顺序
             candidate_names = list(dict.fromkeys(candidate_names))
 
             npz_path = None
@@ -300,9 +349,10 @@ class SemSegTester(TesterBase):
             if npz_path is None:
                 checked_paths = [str(npz_root / f"{name}.npz") for name in candidate_names]
                 raise FileNotFoundError(
-                    "Original npz file was not found. Checked:\n" + "\n".join(checked_paths)
+                    "找不到原始 npz 文件，已尝试:\n" + "\n".join(checked_paths)
                 )
 
+            # 输出文件名也建议去掉 test_ 前缀，和原 npz 对齐
             out_name = npz_path.stem
 
             if test_save_npz:

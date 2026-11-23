@@ -84,7 +84,8 @@ def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_
 
 class SimpleAwareStateSpaceModel(nn.Module):
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2,
-                 dt_rank="auto", conv_bias=True, device=None, dtype=None):
+                 dt_rank="auto", conv_bias=True, device=None, dtype=None,
+                 polarity_write_mode="none"):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
@@ -101,6 +102,22 @@ class SimpleAwareStateSpaceModel(nn.Module):
         self.dim = d_model
         self.d_inner = int(self.expand * self.d_model)
         self.norm = nn.LayerNorm(d_model)
+        # Event-relation conditioning changes state writing, not output gating.
+        modes = {"none", "identity", "geometry", "polarity", "content", "polarity_state"}
+        if polarity_write_mode not in modes:
+            raise ValueError(f"Unknown polarity_write_mode: {polarity_write_mode}")
+        if polarity_write_mode == "polarity_state" and (d_state < 2 or d_state % 2):
+            raise ValueError("polarity_state requires a positive, even d_state >= 2")
+        self.polarity_write_mode = polarity_write_mode
+        self.write_gate = None
+        if polarity_write_mode not in {"none", "polarity_state"}:
+            input_dim = d_model if polarity_write_mode == "content" else 8
+            self.write_gate = nn.Sequential(
+                nn.Linear(input_dim, 8), nn.SiLU(), nn.Linear(8, 1)
+            )
+            # g = 2 * sigmoid(0) = 1: preserve the baseline recurrence initially.
+            nn.init.zeros_(self.write_gate[-1].weight)
+            nn.init.zeros_(self.write_gate[-1].bias)
         self.act = nn.SiLU()
         self.multi_act = nn.Sigmoid()
         
@@ -126,8 +143,15 @@ class SimpleAwareStateSpaceModel(nn.Module):
 
     def A_init(self):
         # S4D real initialization
+        if self.polarity_write_mode == "polarity_state":
+            # Give positive/negative banks the same initial decay spectrum.
+            # Splitting arange(1, 17) directly would make one polarity decay faster.
+            rates = torch.arange(1, self.d_state // 2 + 1, dtype=torch.float32, device=self.device)
+            rates = torch.cat([rates, rates])
+        else:
+            rates = torch.arange(1, self.d_state + 1, dtype=torch.float32, device=self.device)
         A = repeat(
-            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=self.device), "n -> d n", d=self.d_inner,
+            rates, "n -> d n", d=self.d_inner,
         ).contiguous()
         A_log = torch.log(A)  # Keep A_log in fp32
         self.A_log = nn.Parameter(A_log)
@@ -159,10 +183,55 @@ class SimpleAwareStateSpaceModel(nn.Module):
         self.D = nn.Parameter(torch.ones(self.d_inner, device=self.device))  # Keep in fp32
         self.D._no_weight_decay = True
 
+    def get_write_gate(self, normalized_x, valid_mask, relation):
+        if self.polarity_write_mode in {"none", "polarity_state"}:
+            return None
+        if valid_mask is None:
+            raise ValueError("Explicit writing requires a [batch, length] valid_mask")
+        if self.polarity_write_mode == "identity":
+            return valid_mask.unsqueeze(-1).to(normalized_x.dtype)
+        if self.polarity_write_mode == "content":
+            gate_input = normalized_x
+        else:
+            if relation is None or relation.shape != (*normalized_x.shape[:2], 8):
+                raise ValueError("Expected current-path relations of shape [batch, length, 8]")
+            gate_input = relation.to(normalized_x.dtype)
+            if self.polarity_write_mode == "geometry":
+                gate_input = gate_input.clone()
+                gate_input[..., 4:7] = 0  # Remove only the explicit polarity inputs.
+        gate = 2.0 * torch.sigmoid(self.write_gate(gate_input))
+        pair_valid = torch.zeros_like(valid_mask)
+        pair_valid[:, 1:] = valid_mask[:, 1:] & valid_mask[:, :-1]
+        # No previous event exists at a sequence start: use neutral writing.
+        gate = torch.where(pair_valid.unsqueeze(-1), gate, torch.ones_like(gate))
+        return gate * valid_mask.unsqueeze(-1).to(gate.dtype)
+
+    @torch.no_grad()
+    def build_polarity_state_mask(self, polarity, valid_mask):
+        """Route observed event features into +/- halves of one recurrent state.
+
+        polarity: signed metadata [batch, length, 1], serialized in the SAME
+        order as the features. Padding is inactive regardless of its value.
+        Returns [batch, state, length]. Both banks retain their normal dynamics;
+        this mask affects only the input term B*u, never the state transition A.
+        """
+        if self.d_state < 2 or self.d_state % 2:
+            raise ValueError("Polarity state routing requires an even state dimension")
+        if polarity is None or valid_mask is None:
+            raise ValueError("polarity_state requires signed polarity and valid_mask")
+        if polarity.shape != (*valid_mask.shape, 1):
+            raise ValueError("polarity must have shape [batch, length, 1]")
+        p = polarity[..., 0]
+        half = self.d_state // 2
+        positive = ((p > 0) & valid_mask).unsqueeze(1).expand(-1, half, -1)
+        negative = ((p < 0) & valid_mask).unsqueeze(1).expand(-1, half, -1)
+        return torch.cat([positive, negative], dim=1).to(dtype=torch.float32)
+
     def ssm(self, conv1d_out, z,
             x_proj_weight, delta_proj_weight,
             A, B=None, C=None, D=None,
-            delta_bias=None, B_proj_bias=None, C_proj_bias=None, delta_softplus=True):
+            delta_bias=None, B_proj_bias=None, C_proj_bias=None, delta_softplus=True,
+            write_gate=None, state_write_mask=None):
         L = conv1d_out.shape[-1]
         d_state = A.shape[-1] * (1 if not A.is_complex() else 2)
         delta_rank = self.dt_proj.weight.shape[1]
@@ -196,6 +265,27 @@ class SimpleAwareStateSpaceModel(nn.Module):
                 C = C.contiguous()
         if D is not None: D = D.contiguous()
 
+        if write_gate is not None:
+            # write_gate [batch, length, 1], variable B [batch, group, state, length].
+            gate = write_gate.permute(0, 2, 1).to(B.dtype)
+            if B.dim() == 4:
+                gate = gate.unsqueeze(1)
+            elif B.dim() != 3:
+                raise ValueError("Polarity writing expects token-dependent B")
+            B = (B * gate).contiguous()
+
+        if state_write_mask is not None:
+            if write_gate is not None:
+                raise ValueError("Use either relation-gated writing or polarity state routing")
+            # First half of B writes positive evidence; second half writes negative.
+            # C still reads all state dimensions jointly in the original CUDA scan.
+            mask = state_write_mask.to(B.dtype)
+            if B.dim() == 4:
+                mask = mask.unsqueeze(1)
+            elif B.dim() != 3:
+                raise ValueError("Polarity routing expects token-dependent B")
+            B = (B * mask).contiguous()
+
         out = selective_scan_fn(conv1d_out, delta, A, B, C, D, z, delta_bias, delta_softplus)
 
         # return F.linear(rearrange(out, "b d l -> b l d"), out_proj_weight, out_proj_bias)
@@ -203,268 +293,45 @@ class SimpleAwareStateSpaceModel(nn.Module):
 
         
     @autocast(enabled=False)
-    def forward(self, multi_x, valid_mask=None):
-        """
-        Args:
-            multi_x: [B, L, C] padded serialized tokens.
-            valid_mask: optional bool tensor [B, L], where True denotes a
-                valid token. Padding is always placed at the sequence tail.
-        """
-        if multi_x.dtype == torch.float16:
+    def forward(self, multi_x, valid_mask=None, relation=None, polarity=None):
+        if multi_x.dtype in {torch.float16, torch.bfloat16}:
             multi_x = multi_x.float()
-        multi_batch, multi_seqlen, C = multi_x.shape
-        assert C == self.d_model
-
+        multi_batch, multi_seqlen, channels = multi_x.shape
+        if channels != self.d_model:
+            raise ValueError("Input channel count does not match d_model")
         if valid_mask is not None:
             valid_mask = valid_mask.to(device=multi_x.device, dtype=torch.bool)
+            if valid_mask.shape != multi_x.shape[:2]:
+                raise ValueError("valid_mask must have shape [batch, length]")
             multi_x = multi_x * valid_mask.unsqueeze(-1).to(multi_x.dtype)
-
         multi_hidden_states = self.norm(multi_x)
+        if valid_mask is not None:
+            # LayerNorm has an affine bias: mask again before the noncausal conv.
+            multi_hidden_states = multi_hidden_states * valid_mask.unsqueeze(-1).to(multi_hidden_states.dtype)
+        write_gate = self.get_write_gate(multi_hidden_states, valid_mask, relation)
+        state_write_mask = None
+        if self.polarity_write_mode == "polarity_state":
+            state_write_mask = self.build_polarity_state_mask(polarity, valid_mask)
         multix_z = rearrange(
             self.in_proj.weight @ rearrange(multi_hidden_states, "b l d -> d (b l)"),
-            "d (b l) -> b d l",
-            l=multi_seqlen,
+            "d (b l) -> b d l", l=multi_seqlen,
         )
-
-        A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
-
-        if multix_z.stride(-1) != 1:
-            multix_z = multix_z.contiguous()
+        A = -torch.exp(self.A_log.float())
+        multix_z = multix_z.contiguous()
         multix, z = multix_z.chunk(2, dim=1)
-
-        multi_conv1d_out = self.conv1d(multix)
-        mgafeat = self.act(multi_conv1d_out)
-
+        mgafeat = self.act(self.conv1d(multix))
+        if valid_mask is not None:
+            mgafeat = mgafeat * valid_mask.unsqueeze(1).to(mgafeat.dtype)
         ssm_out = self.ssm(
-            conv1d_out=mgafeat,
-            z=z,
+            conv1d_out=mgafeat, z=z,
             x_proj_weight=self.x_proj.weight,
             delta_proj_weight=self.dt_proj.weight,
-            A=A,
-            B=None,
-            C=None,
-            D=self.D.float(),
-            delta_bias=self.dt_proj.bias.float(),
-            delta_softplus=True,
+            A=A, B=None, C=None, D=self.D.float(),
+            delta_bias=self.dt_proj.bias.float(), delta_softplus=True,
+            write_gate=write_gate,
+            state_write_mask=state_write_mask,
         )
-
         mamba_out = self.out_proj(rearrange(ssm_out, "b d l -> b l d"))
         if valid_mask is not None:
             mamba_out = mamba_out * valid_mask.unsqueeze(-1).to(mamba_out.dtype)
         return mamba_out
-
-
-def normalize_mixer_type(mixer_type):
-    """Normalize user-facing aliases used by the ablation switch."""
-    key = str(mixer_type).lower().replace("-", "").replace("_", "")
-    aliases = {
-        "ssm": "ssm",
-        "mamba": "ssm",
-        "mlp": "mlp",
-        "tokenmlp": "mlp",
-        "dwconv": "dwconv",
-        "depthwiseconv": "dwconv",
-        "depthwiseconv1d": "dwconv",
-        "conv1d": "dwconv",
-        "attention": "attention",
-        "attn": "attention",
-        "selfattention": "attention",
-        "lightweightattention": "attention",
-        "sparseconv": "sparseconv",
-        "localsparseconv": "sparseconv",
-        "spconv": "sparseconv",
-    }
-    if key not in aliases:
-        raise ValueError(
-            f"Unknown mixer_type={mixer_type!r}. "
-            "Supported values are: ssm, mlp, dwconv, sparseconv, attention."
-        )
-    return aliases[key]
-
-
-def _apply_valid_mask(x, valid_mask):
-    if valid_mask is None:
-        return x
-    return x * valid_mask.unsqueeze(-1).to(dtype=x.dtype, device=x.device)
-
-
-class TokenMLPMixer(nn.Module):
-    """Point-wise MLP baseline; it performs no inter-token interaction."""
-
-    def __init__(self, d_model, expand=2, drop=0.0):
-        super().__init__()
-        hidden = max(int(d_model * expand), d_model)
-        self.d_model = d_model
-        self.norm = nn.LayerNorm(d_model)
-        self.fc1 = nn.Linear(d_model, hidden, bias=False)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden, d_model, bias=False)
-        self.drop = nn.Dropout(drop)
-
-    @autocast(enabled=False)
-    def forward(self, x, valid_mask=None):
-        if x.dtype == torch.float16:
-            x = x.float()
-        x = _apply_valid_mask(x, valid_mask)
-        x = self.norm(x)
-        x = self.fc2(self.drop(self.act(self.fc1(x))))
-        x = self.drop(x)
-        return _apply_valid_mask(x, valid_mask)
-
-
-class DepthwiseConv1dMixer(nn.Module):
-    """Local sequence baseline using depthwise 1-D convolution."""
-
-    def __init__(self, d_model, kernel_size=5, expand=2, drop=0.0):
-        super().__init__()
-        if kernel_size % 2 != 1:
-            raise ValueError("kernel_size must be odd for length-preserving convolution.")
-        hidden = max(int(d_model * expand), d_model)
-        self.d_model = d_model
-        self.norm = nn.LayerNorm(d_model)
-        self.in_proj = nn.Linear(d_model, hidden, bias=False)
-        self.dwconv = nn.Conv1d(
-            hidden,
-            hidden,
-            kernel_size=kernel_size,
-            padding=kernel_size // 2,
-            groups=hidden,
-            bias=True,
-        )
-        self.act = nn.GELU()
-        self.out_proj = nn.Linear(hidden, d_model, bias=False)
-        self.drop = nn.Dropout(drop)
-
-    @autocast(enabled=False)
-    def forward(self, x, valid_mask=None):
-        if x.dtype == torch.float16:
-            x = x.float()
-        x = _apply_valid_mask(x, valid_mask)
-        x = self.in_proj(self.norm(x))
-        x = self.dwconv(x.transpose(1, 2)).transpose(1, 2)
-        x = self.out_proj(self.drop(self.act(x)))
-        x = self.drop(x)
-        return _apply_valid_mask(x, valid_mask)
-
-
-class WindowSelfAttentionMixer(nn.Module):
-    """
-    Lightweight self-attention on non-overlapping serialized windows.
-
-    Global attention is intentionally avoided because event sequences may contain
-    tens of thousands of tokens. The same spatial/temporal serialization order is
-    retained, while each token interacts only within a fixed-size local window.
-    """
-
-    def __init__(
-        self,
-        d_model,
-        num_heads=2,
-        window_size=128,
-        attn_drop=0.0,
-        proj_drop=0.0,
-    ):
-        super().__init__()
-        if d_model % num_heads != 0:
-            raise ValueError(
-                f"d_model={d_model} must be divisible by num_heads={num_heads}."
-            )
-        if window_size <= 0:
-            raise ValueError("window_size must be positive.")
-        self.d_model = d_model
-        self.window_size = int(window_size)
-        self.norm = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=num_heads,
-            dropout=attn_drop,
-            batch_first=True,
-        )
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    @autocast(enabled=False)
-    def forward(self, x, valid_mask=None):
-        if x.dtype == torch.float16:
-            x = x.float()
-        B, L, C = x.shape
-        if valid_mask is None:
-            valid_mask = torch.ones(B, L, dtype=torch.bool, device=x.device)
-        else:
-            valid_mask = valid_mask.to(device=x.device, dtype=torch.bool)
-
-        x = self.norm(_apply_valid_mask(x, valid_mask))
-
-        pad_len = (-L) % self.window_size
-        if pad_len > 0:
-            x = F.pad(x, (0, 0, 0, pad_len), value=0.0)
-            valid_mask = F.pad(valid_mask, (0, pad_len), value=False)
-
-        L_pad = x.shape[1]
-        num_windows = L_pad // self.window_size
-        x_win = x.reshape(B, num_windows, self.window_size, C).reshape(
-            B * num_windows, self.window_size, C
-        )
-        mask_win = valid_mask.reshape(B, num_windows, self.window_size).reshape(
-            B * num_windows, self.window_size
-        )
-
-        # nn.MultiheadAttention returns NaNs when every key in a window is masked.
-        active = mask_win.any(dim=1)
-        out_win = torch.zeros_like(x_win)
-        if active.any():
-            out_active, _ = self.attn(
-                x_win[active],
-                x_win[active],
-                x_win[active],
-                key_padding_mask=~mask_win[active],
-                need_weights=False,
-            )
-            out_win[active] = out_active
-
-        out = out_win.reshape(B, num_windows, self.window_size, C).reshape(B, L_pad, C)
-        out = self.proj_drop(out[:, :L, :])
-        return _apply_valid_mask(out, valid_mask[:, :L])
-
-
-def build_sequence_mixer(
-    mixer_type,
-    d_model,
-    d_state=16,
-    kernel_size=5,
-    expand=2,
-    drop=0.0,
-    attn_heads=2,
-    attn_window_size=128,
-):
-    """Build the serialized token mixer used in the controlled ablation."""
-    mixer_type = normalize_mixer_type(mixer_type)
-    if mixer_type == "ssm":
-        return SimpleAwareStateSpaceModel(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=kernel_size,
-            expand=expand,
-        )
-    if mixer_type == "mlp":
-        return TokenMLPMixer(d_model=d_model, expand=expand, drop=drop)
-    if mixer_type == "dwconv":
-        return DepthwiseConv1dMixer(
-            d_model=d_model,
-            kernel_size=kernel_size,
-            expand=expand,
-            drop=drop,
-        )
-    if mixer_type == "attention":
-        return WindowSelfAttentionMixer(
-            d_model=d_model,
-            num_heads=attn_heads,
-            window_size=attn_window_size,
-            attn_drop=drop,
-            proj_drop=drop,
-        )
-    if mixer_type == "sparseconv":
-        raise ValueError(
-            "sparseconv operates on the sparse point tensor and is built in the "
-            "PointEvent network file, not in build_sequence_mixer()."
-        )
-    raise RuntimeError(f"Unhandled mixer_type: {mixer_type}")

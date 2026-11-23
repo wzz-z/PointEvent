@@ -14,9 +14,9 @@ from models.utils import offset2batch, batch2offset
 
 class Point(Dict):
     """
-    Point data structure
+    Point Structure of Pointcept
 
-    A Point is a dictionary that contains properties of
+    A Point (point cloud) in Pointcept is a dictionary that contains various properties of
     a batched point cloud. The property with the following names have a specific definition
     as follows:
 
@@ -97,6 +97,7 @@ class Point(Dict):
                 order.shape[0], 1
             ),
         )
+        # order鎸囨帓搴忓悗鐨勫簭鍒楀搴斿師濮嬬殑绱㈠紩
         if shuffle_orders:
             perm = torch.randperm(code.shape[0])
             code = code[perm]
@@ -274,6 +275,7 @@ class Point_V2(Dict):
                 order.shape[0], 1
             ),
         )
+        # order鎸囨帓搴忓悗鐨勫簭鍒楀搴斿師濮嬬殑绱㈠紩
         if shuffle_orders:
             perm = torch.randperm(code.shape[0])
             code = code[perm]
@@ -294,16 +296,20 @@ class Point_V2(Dict):
         # print(f"self.coord.shape: {self.coord.shape}")
         # print(f"self.coord: {self.coord}")
         
+    @torch.no_grad()
     def time_serialization(self):
-        order_ = torch.argsort(self.coord[:, 2]+2*self.batch, descending=False)
-        order_descend = torch.argsort(self.coord[:, 2]+2*self.batch, descending=True)
-        order = torch.cat([order_.unsqueeze(0), order_descend.unsqueeze(0)], dim=0)  
+        # Keep samples in ascending batch order for BOTH scan directions.
+        # Only reverse event order WITHIN each sample.
+        forward_orders, backward_orders = [], []
+        for batch_id in self.batch.unique(sorted=True):
+            idx = torch.nonzero(self.batch == batch_id, as_tuple=False).reshape(-1)
+            local_t = self.coord[idx, 2]
+            forward_orders.append(idx[torch.argsort(local_t, descending=False)])
+            backward_orders.append(idx[torch.argsort(local_t, descending=True)])
+        order = torch.stack([torch.cat(forward_orders), torch.cat(backward_orders)], dim=0)
         inverse = torch.zeros_like(order).scatter_(
-            dim=1,
-            index=order,
-            src=torch.arange(self.coord.size(0), device=order.device).repeat(
-                order.shape[0], 1
-            ),
+            dim=1, index=order,
+            src=torch.arange(self.coord.size(0), device=order.device).repeat(2, 1),
         )
         self["t_serialized_order"] = order
         self["t_serialized_inverse"] = inverse
