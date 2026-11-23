@@ -1,0 +1,9 @@
+_base_ = ["./esuav.py"]
+
+# One SSM per scan, total state dimension 16 = positive 8 + negative 8.
+# Feature widths/depths follow esuav.py (12/24, same as evuav.py).
+model = dict(backbone=dict(
+    polarity_write_mode="polarity_state",
+    polarity_encoding="zero_one",
+))
+save_path = "exp/ESUAV/polarity_state_accum"
